@@ -675,6 +675,13 @@ inline void rcVmad(float* dest, const float* v1, const float* v2, const float s)
 	dest[2] = v1[2]+v2[2]*s;
 }
 
+inline void rcVscale(float* dest, const float* v1, const float s)
+{
+	dest[0] = v1[0]*s;
+	dest[1] = v1[1]*s;
+	dest[2] = v1[2]*s;
+}
+
 /// Performs a vector addition. (@p v1 + @p v2)
 ///  @param[out]	dest	The result vector. [(x, y, z)]
 ///  @param[in]		v1		The base vector. [(x, y, z)]
@@ -1175,10 +1182,28 @@ bool rcMergePolyMeshes(rcContext* ctx, rcPolyMesh** meshes, const int nmeshes, r
 ///  @param[in]		sampleMaxError	The maximum distance the detail mesh surface should deviate from 
 ///  								heightfield data. [Limit: >=0] [Units: wu]
 ///  @param[out]	dmesh			The resulting detail mesh.  (Must be pre-allocated.)
+///  @param[in]		useSphericalCoordinates	Whether to use spherical coordinate system for sampling and triangulation.
 ///  @returns True if the operation completed successfully.
 bool rcBuildPolyMeshDetail(rcContext* ctx, const rcPolyMesh& mesh, const rcCompactHeightfield& chf,
 						   const float sampleDist, const float sampleMaxError,
-						   rcPolyMeshDetail& dmesh);
+						   rcPolyMeshDetail& dmesh, bool useSphericalCoordinates);
+
+/// Backward compatibility version of rcBuildPolyMeshDetail without spherical coordinates parameter.
+///  @ingroup recast
+///  @param[in,out]	ctx				The build context to use during the operation.
+///  @param[in]		mesh			A fully built polygon mesh.
+///  @param[in]		chf				The compact heightfield used to build the polygon mesh.
+///  @param[in]		sampleDist		Sets the distance to use when samping the heightfield. [Limit: >=0] [Units: wu]
+///  @param[in]		sampleMaxError	The maximum distance the detail mesh surface should deviate from 
+///  								heightfield data. [Limit: >=0] [Units: wu]
+///  @param[out]	dmesh			The resulting detail mesh.  (Must be pre-allocated.)
+///  @returns True if the operation completed successfully.
+inline bool rcBuildPolyMeshDetail(rcContext* ctx, const rcPolyMesh& mesh, const rcCompactHeightfield& chf,
+						   const float sampleDist, const float sampleMaxError,
+						   rcPolyMeshDetail& dmesh)
+{
+	return rcBuildPolyMeshDetail(ctx, mesh, chf, sampleDist, sampleMaxError, dmesh, true);
+}
 
 /// Copies the poly mesh data from src to dst.
 ///  @ingroup recast
@@ -1196,6 +1221,76 @@ bool rcCopyPolyMesh(rcContext* ctx, const rcPolyMesh& src, rcPolyMesh& dst);
 ///  @param[out]	mesh	The resulting detail mesh. (Must be pre-allocated.)
 ///  @returns True if the operation completed successfully.
 bool rcMergePolyMeshDetails(rcContext* ctx, rcPolyMeshDetail** meshes, const int nmeshes, rcPolyMeshDetail& mesh);
+
+/// @}
+
+/// @name Spherical Coordinate System Functions
+/// @{
+
+/// Converts spherical coordinates (radius, theta, phi) to Cartesian coordinates (x, y, z).
+/// @param[in] radius The radial distance from origin
+/// @param[in] theta The polar angle (latitude) in radians, 0 at north pole, PI at south pole
+/// @param[in] phi The azimuthal angle (longitude) in radians, 0 at positive x-axis
+/// @param[out] cartesian The resulting Cartesian coordinates [(x, y, z)]
+inline void rcSphericalToCartesian(float radius, float theta, float phi, float* cartesian)
+{
+	float center[3] = {0.0f, 0.0f, 0.0f};
+    float sinTheta = sinf(theta);
+    cartesian[0] = radius * sinTheta * cosf(phi) + center[0];
+    cartesian[1] = radius * cosf(theta) + center[1];
+    cartesian[2] = radius * sinTheta * sinf(phi) + center[2];
+}
+
+/// Converts Cartesian coordinates (x, y, z) to spherical coordinates (radius, theta, phi).
+/// @param[in] cartesian The Cartesian coordinates [(x, y, z)]
+/// @param[out] radius The radial distance from origin
+/// @param[out] theta The polar angle (latitude) in radians
+/// @param[out] phi The azimuthal angle (longitude) in radians
+inline void rcCartesianToSpherical(const float* cartesian, float& radius, float& theta, float& phi)
+{
+	float center[3] = {0.0f, 0.0f, 0.0f};
+    radius = rcVdist(cartesian, center);
+    if (radius < 1e-6f) {
+        theta = 0.0f;
+        phi = 0.0f;
+        return;
+    }
+    theta = acosf(cartesian[1] / radius);
+    phi = atan2f(cartesian[2], cartesian[0]);
+}
+
+/// Projects a spherical point onto a tangent plane at reference point.
+/// Used for sampling spherical surfaces as planar surfaces.
+/// @param[in] spherePoint The spherical point to project [(x, y, z)]
+/// @param[in] referencePoint The reference point on sphere for tangent plane [(x, y, z)]
+/// @param[out] planarPoint The resulting planar coordinates [(u, v)]
+inline void rcSphericalToPlanarProjection(const float* spherePoint, const float* referencePoint, float* planarPoint)
+{
+    float radius, theta_ref, phi_ref;
+    rcCartesianToSpherical(referencePoint, radius, theta_ref, phi_ref);
+    
+    float theta, phi;
+    rcCartesianToSpherical(spherePoint, radius, theta, phi);
+    
+    // Use equirectangular projection centered at reference point
+    planarPoint[0] = radius * (phi - phi_ref) * sinf(theta_ref);
+    planarPoint[1] = radius * (theta - theta_ref);
+}
+
+/// Converts planar coordinates back to spherical coordinates.
+/// @param[in] planarPoint The planar coordinates [(u, v)]
+/// @param[in] referencePoint The reference point on sphere for tangent plane [(x, y, z)]
+/// @param[out] spherePoint The resulting spherical coordinates [(x, y, z)]
+inline void rcPlanarToSphericalProjection(const float* planarPoint, const float* referencePoint, float* spherePoint)
+{
+    float radius, theta_ref, phi_ref;
+    rcCartesianToSpherical(referencePoint, radius, theta_ref, phi_ref);
+    
+    float phi = phi_ref + planarPoint[0] / (radius * sinf(theta_ref));
+    float theta = theta_ref + planarPoint[1] / radius;
+    
+    rcSphericalToCartesian(radius, theta, phi, spherePoint);
+}
 
 /// @}
 

@@ -639,7 +639,8 @@ static bool buildPolyDetail(rcContext* ctx, const float* in, const int nin,
 							const float sampleDist, const float sampleMaxError,
 							const int heightSearchRadius, const rcCompactHeightfield& chf,
 							const rcHeightPatch& hp, float* verts, int& nverts,
-							rcIntArray& tris, rcIntArray& edges, rcIntArray& samples)
+							rcIntArray& tris, rcIntArray& edges, rcIntArray& samples,
+							bool useSphericalCoordinates = false)
 {
 	static const int MAX_VERTS = 127;
 	static const int MAX_TRIS = 255;	// Max tris for delaunay is 2n-2-k (n=num verts, k=num hull verts).
@@ -649,6 +650,20 @@ static bool buildPolyDetail(rcContext* ctx, const float* in, const int nin,
 	int nhull = 0;
 	
 	nverts = nin;
+	
+	// Spherical coordinate system support
+	float referencePoint[3] = {0,0,0};
+	if (useSphericalCoordinates && nin > 0) {
+		// Calculate reference point for spherical projection (center of polygon)
+		rcVcopy(referencePoint, in);
+		for (int i = 1; i < nin; ++i) {
+			rcVadd(referencePoint, referencePoint, &in[i*3]);
+		}
+		rcVscale(referencePoint, referencePoint, 1.0f / nin);
+		
+		// Normalize reference point to unit sphere
+		rcVnormalize(referencePoint);
+	}
 	
 	for (int i = 0; i < nin; ++i)
 		rcVcopy(&verts[i*3], &in[i*3]);
@@ -707,7 +722,18 @@ static bool buildPolyDetail(rcContext* ctx, const float* in, const int nin,
 				pos[0] = vj[0] + dx*u;
 				pos[1] = vj[1] + dy*u;
 				pos[2] = vj[2] + dz*u;
-				pos[1] = getHeight(pos[0],pos[1],pos[2], cs, ics, chf.ch, heightSearchRadius, hp)*chf.ch;
+				
+				// Apply spherical coordinate transformation if enabled
+				if (useSphericalCoordinates) {
+					float planarPos[2];
+					rcSphericalToPlanarProjection(pos, referencePoint, planarPos);
+					// Use planar coordinates for height sampling
+					pos[1] = getHeight(planarPos[0], planarPos[1], 0, cs, ics, chf.ch, heightSearchRadius, hp)*chf.ch;
+					// Convert back to spherical coordinates
+					rcPlanarToSphericalProjection(planarPos, referencePoint, pos);
+				} else {
+					pos[1] = getHeight(pos[0],pos[1],pos[2], cs, ics, chf.ch, heightSearchRadius, hp)*chf.ch;
+				}
 			}
 			// Simplify samples.
 			int idx[MAX_VERTS_PER_EDGE] = {0,nn};
@@ -799,25 +825,59 @@ static bool buildPolyDetail(rcContext* ctx, const float* in, const int nin,
 			rcVmin(bmin, &in[i*3]);
 			rcVmax(bmax, &in[i*3]);
 		}
-		int x0 = (int)floorf(bmin[0]/sampleDist);
-		int x1 = (int)ceilf(bmax[0]/sampleDist);
-		int z0 = (int)floorf(bmin[2]/sampleDist);
-		int z1 = (int)ceilf(bmax[2]/sampleDist);
+		
+		int x0, x1, z0, z1;
+		if (useSphericalCoordinates) {
+			// For spherical coordinates, calculate bounds in planar projection space
+			float planarBmin[2], planarBmax[2];
+			for (int i = 0; i < nin; ++i) {
+				float planarPt[2];
+				rcSphericalToPlanarProjection(&in[i*3], referencePoint, planarPt);
+				if (i == 0) {
+					rcVcopy(planarBmin, planarPt);
+					rcVcopy(planarBmax, planarPt);
+				} else {
+					rcVmin(planarBmin, planarPt);
+					rcVmax(planarBmax, planarPt);
+				}
+			}
+			x0 = (int)floorf(planarBmin[0]/sampleDist);
+			x1 = (int)ceilf(planarBmax[0]/sampleDist);
+			z0 = (int)floorf(planarBmin[1]/sampleDist);
+			z1 = (int)ceilf(planarBmax[1]/sampleDist);
+		} else {
+			x0 = (int)floorf(bmin[0]/sampleDist);
+			x1 = (int)ceilf(bmax[0]/sampleDist);
+			z0 = (int)floorf(bmin[2]/sampleDist);
+			z1 = (int)ceilf(bmax[2]/sampleDist);
+		}
+		
 		samples.clear();
 		for (int z = z0; z < z1; ++z)
 		{
 			for (int x = x0; x < x1; ++x)
 			{
 				float pt[3];
-				pt[0] = x*sampleDist;
-				pt[1] = (bmax[1]+bmin[1])*0.5f;
-				pt[2] = z*sampleDist;
-				// Make sure the samples are not too close to the edges.
-				if (distToPoly(nin,in,pt) > -sampleDist/2) continue;
-				samples.push(x);
-				samples.push(getHeight(pt[0], pt[1], pt[2], cs, ics, chf.ch, heightSearchRadius, hp));
-				samples.push(z);
-				samples.push(0); // Not added
+				if (useSphericalCoordinates) {
+					float planarPt[2] = {x*sampleDist, z*sampleDist};
+					rcPlanarToSphericalProjection(planarPt, referencePoint, pt);
+					// Make sure the samples are not too close to the edges.
+					if (distToPoly(nin,in,pt) > -sampleDist/2) continue;
+					samples.push(x);
+					samples.push(getHeight(planarPt[0], planarPt[1], 0, cs, ics, chf.ch, heightSearchRadius, hp));
+					samples.push(z);
+					samples.push(0); // Not added
+				} else {
+					pt[0] = x*sampleDist;
+					pt[1] = (bmax[1]+bmin[1])*0.5f;
+					pt[2] = z*sampleDist;
+					// Make sure the samples are not too close to the edges.
+					if (distToPoly(nin,in,pt) > -sampleDist/2) continue;
+					samples.push(x);
+					samples.push(getHeight(pt[0], pt[1], pt[2], cs, ics, chf.ch, heightSearchRadius, hp));
+					samples.push(z);
+					samples.push(0); // Not added
+				}
 			}
 		}
 		
@@ -839,11 +899,20 @@ static bool buildPolyDetail(rcContext* ctx, const float* in, const int nin,
 				const int* s = &samples[i*4];
 				if (s[3]) continue; // skip added.
 				float pt[3];
-				// The sample location is jittered to get rid of some bad triangulations
-				// which are cause by symmetrical data from the grid structure.
-				pt[0] = s[0]*sampleDist + getJitterX(i)*cs*0.1f;
-				pt[1] = s[1]*chf.ch;
-				pt[2] = s[2]*sampleDist + getJitterY(i)*cs*0.1f;
+				if (useSphericalCoordinates) {
+					// The sample location is jittered to get rid of some bad triangulations
+					// which are cause by symmetrical data from the grid structure.
+					float planarPt[2] = {
+						s[0]*sampleDist + getJitterX(i)*cs*0.1f,
+						s[2]*sampleDist + getJitterY(i)*cs*0.1f
+					};
+					rcPlanarToSphericalProjection(planarPt, referencePoint, pt);
+					pt[1] = s[1]*chf.ch;
+				} else {
+					pt[0] = s[0]*sampleDist + getJitterX(i)*cs*0.1f;
+					pt[1] = s[1]*chf.ch;
+					pt[2] = s[2]*sampleDist + getJitterY(i)*cs*0.1f;
+				}
 				float d = distToTriMesh(pt, verts, nverts, &tris[0], tris.size()/4);
 				if (d < 0) continue; // did not hit the mesh.
 				if (d > bestd)
@@ -1170,7 +1239,7 @@ static unsigned char getTriFlags(const float* va, const float* vb, const float* 
 /// @see rcAllocPolyMeshDetail, rcPolyMesh, rcCompactHeightfield, rcPolyMeshDetail, rcConfig
 bool rcBuildPolyMeshDetail(rcContext* ctx, const rcPolyMesh& mesh, const rcCompactHeightfield& chf,
 						   const float sampleDist, const float sampleMaxError,
-						   rcPolyMeshDetail& dmesh)
+						   rcPolyMeshDetail& dmesh, bool useSphericalCoordinates)
 {
 	rcAssert(ctx);
 	
@@ -1303,7 +1372,7 @@ bool rcBuildPolyMeshDetail(rcContext* ctx, const rcPolyMesh& mesh, const rcCompa
 							 sampleDist, sampleMaxError,
 							 heightSearchRadius, chf, hp,
 							 verts, nverts, tris,
-							 edges, samples))
+							 edges, samples, useSphericalCoordinates))
 		{
 			return false;
 		}
@@ -1331,60 +1400,29 @@ bool rcBuildPolyMeshDetail(rcContext* ctx, const rcPolyMesh& mesh, const rcCompa
 		dmesh.meshes[i*4+2] = (unsigned int)dmesh.ntris;
 		dmesh.meshes[i*4+3] = (unsigned int)ntris;
 		
-		// Store vertices, allocate more memory if necessary.
-		if (dmesh.nverts+nverts > vcap)
-		{
-			while (dmesh.nverts+nverts > vcap)
-				vcap += 256;
-			
-			float* newv = (float*)rcAlloc(sizeof(float)*vcap*3, RC_ALLOC_PERM);
-			if (!newv)
-			{
-				ctx->log(RC_LOG_ERROR, "rcBuildPolyMeshDetail: Out of memory 'newv' (%d).", vcap*3);
-				return false;
-			}
-			if (dmesh.nverts)
-				memcpy(newv, dmesh.verts, sizeof(float)*3*dmesh.nverts);
-			rcFree(dmesh.verts);
-			dmesh.verts = newv;
-		}
+		// Store vertices.
 		for (int j = 0; j < nverts; ++j)
 		{
-			dmesh.verts[dmesh.nverts*3+0] = verts[j*3+0];
-			dmesh.verts[dmesh.nverts*3+1] = verts[j*3+1];
-			dmesh.verts[dmesh.nverts*3+2] = verts[j*3+2];
+			rcVcopy(&dmesh.verts[dmesh.nverts*3], &verts[j*3]);
 			dmesh.nverts++;
 		}
-		
-		// Store triangles, allocate more memory if necessary.
-		if (dmesh.ntris+ntris > tcap)
-		{
-			while (dmesh.ntris+ntris > tcap)
-				tcap += 256;
-			unsigned char* newt = (unsigned char*)rcAlloc(sizeof(unsigned char)*tcap*4, RC_ALLOC_PERM);
-			if (!newt)
-			{
-				ctx->log(RC_LOG_ERROR, "rcBuildPolyMeshDetail: Out of memory 'newt' (%d).", tcap*4);
-				return false;
-			}
-			if (dmesh.ntris)
-				memcpy(newt, dmesh.tris, sizeof(unsigned char)*4*dmesh.ntris);
-			rcFree(dmesh.tris);
-			dmesh.tris = newt;
-		}
+		// Store triangles.
 		for (int j = 0; j < ntris; ++j)
 		{
 			const int* t = &tris[j*4];
-			dmesh.tris[dmesh.ntris*4+0] = (unsigned char)t[0];
-			dmesh.tris[dmesh.ntris*4+1] = (unsigned char)t[1];
-			dmesh.tris[dmesh.ntris*4+2] = (unsigned char)t[2];
+			dmesh.tris[dmesh.ntris*4+0] = (unsigned char)(dmesh.meshes[i*4+0] + t[0]);
+			dmesh.tris[dmesh.ntris*4+1] = (unsigned char)(dmesh.meshes[i*4+0] + t[1]);
+			dmesh.tris[dmesh.ntris*4+2] = (unsigned char)(dmesh.meshes[i*4+0] + t[2]);
 			dmesh.tris[dmesh.ntris*4+3] = getTriFlags(&verts[t[0]*3], &verts[t[1]*3], &verts[t[2]*3], poly, npoly);
 			dmesh.ntris++;
 		}
 	}
 	
+	rcFree(hp.data);
+	
 	return true;
 }
+
 
 /// @see rcAllocPolyMeshDetail, rcPolyMeshDetail
 bool rcMergePolyMeshDetails(rcContext* ctx, rcPolyMeshDetail** meshes, const int nmeshes, rcPolyMeshDetail& mesh)
